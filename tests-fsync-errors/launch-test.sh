@@ -1,6 +1,6 @@
 #!/bin/bash
 #------------------------------------------------------------------------------
-# Inprired by: https://github.com/ringerc/scrapcode/blob/master/testcases/
+# Inspired by: https://github.com/ringerc/scrapcode/blob/master/testcases/
 #------------------------------------------------------------------------------
 
 set -e -u -x
@@ -18,7 +18,7 @@ echo "- PGDATA: ${PGDATA}"
 # arguments to avoid the script being run on a wrong environment
 
 
-if [ -z "$1" ] || [ "$1" -ne "--run" ]; then
+if [ -z "$1" ] || [ "$1" != "--run" ]; then
     echo "
 If you seriously intend to run this script despite the previous warning, try
 again with \"--run\" option.
@@ -29,14 +29,16 @@ fi
 
 shift
 
-if [ "$1" -ne "--force-run" ]; then
+if [ "$1" != "--force-run" ]; then
     echo "Do you really want to run the tests on this environement?"
     select yn in "Yes" "No"; do
-        case $yn in
-            "Yes") break;;
-            "No") exit;;
+        case $REPLY in
+            1|"Yes") break;;
+            2|"No") exit;;
+            *) echo "Choice \"$yn\" or answer \"$REPLY\" is invalid.";;
         esac
     done
+else
     shift
 fi
 
@@ -96,6 +98,9 @@ prepare_instance() {
     # that have any importance?  how does the checkpoint order the buffers to
     # be synced?)
     # FIXME check bgwriter configuration
+    # FIXME checkpoint_completion_target is setup to 0.5 so that 50% of the
+    # time will be used to modify buffers, and no modification will occur
+    # during checkpoints.  Hopefully that should help analysis.
     psql <<EOF
 ALTER SYSTEM SET logging_collector = on;
 ALTER SYSTEM SET log_destination = 'stderr, csvlog';
@@ -103,7 +108,7 @@ ALTER SYSTEM SET log_filename = 'postgresql.log';
 ALTER SYSTEM SET log_checkpoints = on;
 ALTER SYSTEM SET log_error_verbosity = verbose;
 ALTER SYSTEM SET max_wal_size = '5GB';
-ALTER SYSTEM SET checkpoint_timeout = '10min';
+ALTER SYSTEM SET checkpoint_timeout = '60min';
 ALTER SYSTEM SET checkpoint_completion_target = '0.5';
 ALTER SYSTEM SET autovacuum = off;
 EOF
@@ -134,9 +139,9 @@ CREATE TABLE reftable(
     insert_lsn pg_lsn DEFAULT pg_current_wal_insert_lsn()
 );
 -- Create table to generate dirty blocks and add memory pressure.
-CREATE TABLE filltable(
-    padding char(474) NOT NULL
-);
+--CREATE TABLE filltable(
+--    padding char(474) NOT NULL
+--);
 -- Table used to store checkpoints details.
 CREATE TABLE checkpoint_log(
     checkpoint_lsn pg_lsn,
@@ -192,9 +197,9 @@ EOF
 
 # Execute a query on PostgreSQL instance, and return the results to caller.  If
 # the query fails, check whether this is a temporary failure, or a persistent
-# one that can be resolved.
-# FIXME very bad name, should be implying we ignore corruptions on failure
-failsafe_query() {
+# one that can be resolved, and in either case obstinately retries the query,
+# even if it means corrupting the instance (resetwal) to do so.
+stubborn_query() {
     psql_args=( "$@" )
     stdin="$(cat -)"
     RECOVER_TIMEOUT="10"
@@ -236,11 +241,27 @@ failsafe_query() {
             # Start PostgreSQL and wait for startup to finish.
             pg_ctl -D "$PGDATA" -w start -l "${PGDATA}/startup.log"
 
-            # FIXME truncate filltable after this, to avoid side effect of the
-            # resetwal
-            psql -At <<EOF
-TRUNCATE filltable;
+            # FIXME re-create filltables after this, to avoid side effect of
+            # the resetwal (corrupted catalog pointing on non-existant tables).
+            # FIXME note that we may also have orphaned files
+            # FIXME this is way too long
+            # FIXME end with a forced checkpoint?
+            relcount=1
+            while [ "$relcount" -le "$relations_to_fill" ]; do
+                psql -Atc <<EOF
+DROP TABLE IF EXISTS filltable_${relcount}";
+CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL)";
 EOF
+                (( ++relcount ))
+            done
+            # vacuum critical catalog tables to avoid excess bloating due to
+            # many relations dropped/created
+            psql -Atc "VACUUM pg_catalog.pg_class"
+            psql -Atc "VACUUM pg_catalog.pg_attribute"
+            psql -Atc "VACUUM pg_catalog.pg_type"
+            psql -Atc "VACUUM pg_catalog.pg_depend"
+            # FIXME is this usefull?
+            psql -Atc 'CHECKPOINT'
 
             # Copy resetwal informations to keep track of what happened here
             # during analysis (corruptions caused by usage of pg_resetwal
@@ -260,13 +281,14 @@ EOF
     done
 }
 
+# FIXME is this necessary?  Is this dependant en the FS used (XFS, EXT4, etc.)?
 pre_insert_data() {
     # Insert data to quickly fill the begining of a FS raising errors, and get
     # to the position errors will be more likely to appear.
     # FIXME first test: logical block 14330
     # FIXME second test: size was 2344 kB, logical block 14334
-    # FIXME set a variable for this.
-    failsafe_query -v "lines=3488" -At <<EOF
+    # FIXME set a variable for this, depending on FS used?
+    stubborn_query -v "lines=${PREFILL_LINES_COUNT}" -At <<EOF
 WITH inserted AS (
     INSERT INTO errtable (padding)
     SELECT ('blanks follow:')
@@ -282,10 +304,13 @@ insert_data() {
     # Insert just enough lines to fill several data blocks.  To help
     # diagnostics, also save current timestamp and LSN (reftable columns
     # default value) and latest started checkpoint LSN.
+    # This is the insertion that should ultimately write to bad blocks, and
+    # trigger writeback errors... but the insertion itself should succeed, it's
+    # the next occuring checkpoint that needs to fail.
     # FIXME zero_damaged_pages necessary?
-    failsafe_query -v "lines=${ERROR_LINES_COUNT}" -At <<EOF
+    stubborn_query -v "lines=${ERROR_LINES_COUNT}" -At <<EOF
 -- Avoid query failing on read errors.
-SET zero_damaged_pages = ON;
+--SET zero_damaged_pages = ON;
 WITH inserted AS (
     INSERT INTO errtable (padding)
     SELECT ('blanks follow:')
@@ -332,33 +357,52 @@ saturate_memory() {
     # Table used to saturate memory with dirty buffers, without causing I/O
     # errors.  We create a new table and try to drop the previous one before
     # inserting.  We cannot just truncate and use the same one because we may
-    # use pg_resetwal if we PANIC, and that may leave use with an orphaned
+    # use pg_resetwal if we PANIC, and that may leave us with an orphaned
     # Shrödinger's table, already dropped and already created at the same time
     # (obviously, that's because the catalog is corrupted, but having used
     # pg_resetwal that was to be expected).  So it is best to abandon the old
     # table if it can not be dropped, and move to a new one.
-    # FIXME does not work, old table is never dropped and fills FS
-    # FIXME to replace using DELETE/VACUUM/INSERT?  That will be longer though,
-    # and generate many WALs.
-    failsafe_query -v "lines=${lines_to_fill}" -At <<EOF
-DELETE FROM filltable;
-VACUUM filltable;
-INSERT INTO filltable (padding)
+
+    # FIXME TRUNCATE is used here to "burn" file descriptors, and help to
+    # trigger the "silent" error
+    # FIXME is there a threshold to trigger file descriptor cache reuse?
+
+    # FIXME warning, failure and resewal can leave us in a very incoherent
+    # state here, with orphaned files and corrupted catalog pointing on non
+    # existant files...
+    # FIXME this is very, very long (~20 min. for 80640 tables)
+    relcount=1
+    while [ "$relcount" -le "$relations_to_fill" ]; do
+        stubborn_query -At <<EOF
+TRUNCATE filltable_${relcount};
+INSERT INTO filltable_${relcount} (padding)
     SELECT ('blanks follow:')
-    FROM generate_series(1,:lines);
+    FROM generate_series(1,16);
 EOF
+    (( ++relcount ))
+    done
+    # vacuum critical catalog tables to avoid excess bloating due to many
+    # relations truncated
+    stubborn_query -At <<EOF
+VACUUM pg_catalog.pg_class;
+VACUUM pg_catalog.pg_attribute;
+VACUUM pg_catalog.pg_type;
+VACUUM pg_catalog.pg_depend;
+EOF
+    # ~ 35 min
+
 }
 
 wait_checkpoint() {
     # Get latest checkpoint LSN from data inserted into reference table.
-    last_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM reftable ORDER BY refid DESC LIMIT 1;" | failsafe_query -At)
-    curr_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM pg_control_checkpoint();" | failsafe_query -At)
+    last_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM reftable ORDER BY refid DESC LIMIT 1;" | stubborn_query -At)
+    curr_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM pg_control_checkpoint();" | stubborn_query -At)
     while [ "$last_chkp_lsn" == "$curr_chkp_lsn" ]; do
         sleep 1
-        curr_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM pg_control_checkpoint();" | failsafe_query -At)
+        curr_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM pg_control_checkpoint();" | stubborn_query -At)
     done
     # Save latest checkpoint informations to keep history.
-    failsafe_query -At <<EOF
+    stubborn_query -At <<EOF
 COPY (
     SELECT checkpoint_lsn, redo_lsn, checkpoint_time
     FROM pg_control_checkpoint()
@@ -370,7 +414,7 @@ EOF
 launch_scenario() {
 
     # Log the last successfull checkpoint, before testing starts.
-    failsafe_query -At <<EOF
+    stubborn_query -At <<EOF
 COPY (
     SELECT checkpoint_lsn, redo_lsn, checkpoint_time
     FROM pg_control_checkpoint()
@@ -582,7 +626,7 @@ EOF
     sed -ne "/${label}/,$ p" "$PGLOG" > "${report_dir}/full_report/postgresql.log"
     # Generate short report contents.
     # Missing lines.
-    missing_lines=$(psql -Atc "SELECT count(*) FROM missing_lines")
+    missing_lines=$(psql -Atc "SELECT sum(missing_lines) FROM missed_errors")
     echo "Missing lines due to corruptions: $missing_lines" >> "${report_dir}/short_report.txt"
 
 }
@@ -712,13 +756,9 @@ EOF
 # error to test.
 
 # Number of tests that will be run (including waiting for the next timed
-# checkpoint, so every test should be around 30 seconds, but can run up to 1
-# minute if resetwal is required).
-# FIXME adapt comment to checkpoint_timeout value
-# - 200: about 3 hours
-# - 400: about 6 hours
-# - 800: about 12 hours
-TEST_COUNT=20
+# checkpoint, so every test should be around 10 minutes, but can run up to 30
+# minutes if resetwal is required).
+TEST_COUNT=3
 # Number of lines to be inserted into the error table (due to the table
 # attributes definition, 16 lines means one full 8kB data block).
 # FIXME 512 lines gives 32 blocks, or 256kB.  With checkpoint_timeout set to
@@ -728,6 +768,7 @@ TEST_COUNT=20
 # done with a much lower line count (the ideal would be the minimum, meaning 16
 # or just one 8kB block).
 ERROR_LINES_COUNT=16
+PREFILL_LINES_COUNT=64
 
 # Scenario section.
 # FIXME to be adapted, using a configuration file?
@@ -769,7 +810,7 @@ EOF
     ;;
   "3")
     # Scenario 3
-    # FIXME very high shared buffers to sature memory during checkpoints
+    # FIXME very high (relatively) shared buffers to sature memory during checkpoints
     psql <<EOF
 ALTER SYSTEM SET shared_buffers = '700MB';
 ALTER SYSTEM SET checkpoint_flush_after = 0;
@@ -801,7 +842,6 @@ ALTER SYSTEM SET shared_buffers = '128kB';
 ALTER SYSTEM SET checkpoint_flush_after = 0;
 ALTER SYSTEM SET bgwriter_flush_after = 0;
 ALTER SYSTEM SET backend_flush_after = 0;
-SELECT pg_reload_conf();
 EOF
     # Restart.
     pg_ctl -D "$PGDATA" -m fast -w stop
@@ -820,12 +860,26 @@ esac
 # trigger errors we want the checkpointer to get), we work on 90% af shared
 # buffers.
 # FIXME only for saturate_memory scenarios?  bool GUC?
-lines_to_fill=$(psql -At << EOF
-SELECT ( setting::int * 0.9 * 16 )::int
+# FIXME instead, generate "relations_to_fill" tables, and truncate every one to
+# mess with the system fd cache... but this is very, very long.  Should we
+# "burn" fd differently, outside from postgres?
+relations_to_fill=$(psql -At << EOF
+SELECT ( setting::int * 0.9 )::int
 FROM pg_settings
 WHERE name = 'shared_buffers';
 EOF
 )
+
+# FIXME create all "relations to fill"
+# FIXME this is way too long
+# FIXME end with a forced checkpoint?
+#       ~20 min for 80640 tables
+relcount=1
+while [ "$relcount" -le "$relations_to_fill" ]; do
+    psql -Atc "CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL)"\
+        && (( ++relcount ))
+done
+psql -Atc 'CHECKPOINT'
 
 # Lauch test
 launch_scenario
@@ -837,6 +891,7 @@ launch_scenario
 
 
 # We should get at least one last timed checkpoint here.
+# FIXME not true anymore, depends on "checkpoint_timeout" parameter value
 sleep 60
 # Force two checkpoints to force PostgreSQL to believe data has been synced...
 # based on Linux fsync behaviour and unpatched PostgreSQL assomptions, even if
@@ -844,8 +899,10 @@ sleep 60
 # if that's the shutdown's checkpoint that fails, PostgreSQL will rightfully
 # try to recover using WALs, that will fail because of disk errors, and then
 # the instance will not be able to start.
-psql -c 'CHECKPOINT;' || true
-psql -c 'CHECKPOINT;' || true
+# FIXME only useful to simulate old 11.1 behaviour, when failed fsyncs on
+# checkpoint would not automatically PANIC
+psql -Atc 'CHECKPOINT' || true
+psql -Atc 'CHECKPOINT' || true
 
 # FIXME force restart and drop system caches to see the results
 pg_ctl -D "$PGDATA" -m fast -w stop

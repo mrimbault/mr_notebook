@@ -237,7 +237,8 @@ high_error_fs_setup() {
     # Bad blocks hole size.
     ERRSZ=$(( 3 * BLOCKS_KB ))
     # Alternate with this sane blocks size.
-    SANESZ=$(( 29 * BLOCKS_KB ))
+    #SANESZ=$(( 29 * BLOCKS_KB ))
+    SANESZ=$(( 5 * BLOCKS_KB ))
     # Sane blocks size at the middle to avoid errors before testing.
     MDLSTARTSZ=$(( 48 * BLOCKS_MB ))
     MDLSZ=$(( 8 * BLOCKS_MB ))
