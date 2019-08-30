@@ -9,7 +9,7 @@ Quick reminder of the issue:
 > The fundamental problem is that postgres assumed that any IO error would
 > be reported at fsync time, and that the error would be reported until
 > resolved. That's not true in several operating systems, linux included.
-Source : [[https://lwn.net/Articles/753184/]]
+Source : https://lwn.net/Articles/753184/
 
 An important word of caution:
 These testing scripts are designed to produce false I/O errors that corrupt
@@ -27,9 +27,27 @@ Various pointers about problem these scripts try to reproduce:
 Scripts inspired by Craig Ringer test case:
 - https://github.com/ringerc/scrapcode/tree/master/testcases/fsync-error-clear
 
+
+
+
+## Useful references
+
+
+Patch "PANIC on fsync" introduced in 11.2:
+
+- https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=9ccdd7f66e3324d2b6d3dec282cfa9ff084083f1
+- 
+
+Thomas Munro conference on difficulties for PostgreSQL hackers interacting with OS: https://papers.freebsd.org/2019/FOSDEM/munro-walking_through_walls.files/fosdem_walking_through_walls.pdf
+
+Ideas about reproducting the problem when PostgreSQL does not see the error :
+https://www.postgresql-archive.org/PostgreSQL-s-handling-of-fsync-errors-is-unsafe-and-risks-data-loss-at-least-on-XFS-tt6013521.html#a6015411
+
+
+
 ## Mechanics analysis
 
-As of 2019, May 27 - latest PostgreSQL version is 11.3.
+As of 2019, August 4 - latest stable PostgreSQL version is 11.4.
 
 ### File manipulation
 
@@ -49,6 +67,7 @@ using `max_files_per_process` setting (it is taken in account while defining
 the internal variable `max_safe_fds` used by the actual code, but PostgreSQL
 also tries to compute actual system limits including already opened file
 descriptors).
+FIXME is this section stolen from somewhere?
 
 See the following comments for detailed descriptions:
 - https://doxygen.postgresql.org/fd_8c_source.html#l00262
@@ -63,12 +82,13 @@ Interesting quote:
 When a PostgreSQL backend has to interact with a file (to read, write, sync,
 etc.), it starts with calling for `FileAccess()` function
 (https://doxygen.postgresql.org/fd_8c.html#a72019405c5608c4d3d599abfcfda2503).
-This function will insert the FD into the Lru ring if not already present,
-possibly removing the least recently used entries in the process.  This Lru
+This function will insert the FD into the LRU ring if not already present,
+possibly removing the least recently used entries in the process.  This LRU
 ring cleaning is ultimately done by calling the `ReleaseLruFiles()` function to
 remove entries until the number of entries is lower than `max_safe_fds`.  So
 even if a running backend process has previously accessed a file, there is not
 guarantee that the related FD is still opened.
+FIXME this is the case even for temporary files... but these are not fsync'ed
 
 In any case, when the backend is closed at disconnection, if some FD are still
 in use by the process, they are also closed.  But dirty data probably still is
@@ -77,6 +97,16 @@ possibly opening again the files before "fsyncing" them.
 
 
 ### Checkpointer
+
+FIXME TODO
+
+
+### Background writer
+
+FIXME TODO
+
+
+### Linux background tasks at work
 
 FIXME TODO
 
@@ -105,12 +135,12 @@ My test scenario does the following:
   4.13, 4.15 and 4.16, and possibly before 4.13)
 - write some data on another, sane, table, to dirty more buffers and accelerate
   the writeback
-- wait for a timed checkpoint to happen (to ensure only one of these writes is
-  done for every checkpoint)
+- wait for a timed checkpoint to happen (to ensure only one of these failing
+  writes is done for every checkpoint)
 - rince and repeat for enough time to have several timed checkpoints triggered
 - force one last checkpoint, and shutdown propertly (mode "fast", NOT
   "immediate", so another immediate checkpoint occurs here)
-- sync filesystem cache to storage, and force empty it
+- sync filesystem cache to storage, and forcefully drop it
 - restart the PostgreSQL instance, and compute a report on both the missing
   data, and the various logged events (system and PostgreSQL errors, and
   PostgreSQL checkpoints details)
@@ -123,11 +153,36 @@ unrelated to the problem studied here.  In consequence these data corruptions
 are excluded from final analysis.
 
 Now, what is much more difficult (at least to me) is to reproduce the second
-problem, when PostgreSQL never gets the error.  At the time of writing, I was
-never able to trigger it using this basic test, even on versions of kernel
-older that 4.13.  In a way, that is good news, but being able to reproduce the
-problem would help to know what configurations may be more at risk, and measure
-the positive effects of patchs written to fix this issue.
+problem, when PostgreSQL never gets the error.
+Craig Ringer managed to simulate this outside of PostgreSQL using a standalone
+test
+(https://github.com/ringerc/scrapcode/tree/master/testcases/fsync-error-clear/standalone),
+but what I would like is to see if it is possible to reproduce this behaviour
+on a proper, non modified PostgreSQL instance.
+
+At the time of writing, I was only able to trigger it with only one specific
+scenario.  In a way, the difficulty to reproduce is good news, because it seems
+that the problem is not that easy to trigger using a "default"
+configuration/workload.
+
+I can reproduce the problem by aggressively truncating and inserting
+data into many tables on another tablespace.  When the amount of data and
+tables exceeds a certain threshold, writeback is triggered sooner, and the
+errors are captured before the checkpoint can see them.  This test case needs
+some improvements, because the testing takes too long, but I still don't
+understand what exactly triggers the writeback at this point (that would help
+me to simplify the scenario).
+
+Specifically, what is done in the scenario that triggers the issue:
+- local volume using dmsetup to simulate errors only on some blocs,
+  specifically crafted for this scenario)
+- very aggressive configuration of Linux page background writeback
+- PostgreSQL shared buffers configured to use most of the server memory (so if
+  most is dirty, checkpoint has more to write that the FS cache)
+- disabling `*flush_after` PostgreSQL parameters
+- workload on another, sane FS, with many data modifications and table
+  truncation (so we will get most of the shared buffers dirty before the
+  begining the the checkpoint, AND we will consume file descriptors very fast)
 
 Various ideas about how to improve the testing:
 - various FS cache writeback configurations (`dirty_*`)
@@ -145,6 +200,14 @@ Various ideas about how to improve the testing:
   - hypervisor bad blocks
   - same three with transient permission problems (effect of an erroneous
     `chmod -R`)
+
+FIXME role of `max_files_per_process` parameter...  this thread
+"Fsync-before-close thought experiment" seem to link the corruption behaviour
+to "Vfd" pressure?
+FIXME this and Robert Haas answer are interesting about possible fix
+implementations
+Thread: https://www.postgresql.org/message-id/flat/CA%2BTgmob1OotvHkQmjy%3DGcw_oo80vTexgz%2BU6c7QPGVd%3DQ_JB5A%40mail.gmail.com#84caa31ddb094892cda5ae8c79988131
+
 
 
 ## Environment used
@@ -166,6 +229,52 @@ Various ideas about how to improve the testing:
 
 
 
+
+## Analysis
+
+Check if there is missing lines:
+```sql
+SELECT * FROM missed_errors;
+```
+
+See full analysis of scenario:
+```sql
+SELECT * FROM analysis;
+```
+
+
+Audit file analysis.
+- report on syscalls:
+  ```bash
+  aureport -s -i -if audit_file.log
+  ```
+- report on files:
+  ```bash
+  aureport -f -i -if audit_file.log
+  ```
+- report on processes:
+  ```bash
+  aureport -p -i -if audit_file.log
+  ```
+
+
+Debug using compilator's flags:
+- FDDEBUG: https://doxygen.postgresql.org/fd_8c_source.html#l00153
+
+
+Kernel debug analysis.
+FIXME
+- https://www.kernel.org/doc/html/latest/trace/events.html
+- https://www.kernel.org/doc/html/latest/trace/ftrace.html
+- https://www.kernel.org/doc/html/latest/trace/tracepoint-analysis.html
+- http://www.brendangregg.com/perf.html
+- https://www.kernel.org/doc/html/latest/filesystems/api-summary.html#events-based-on-file-descriptors
+
+
+Other analysis tools
+- FIXME
+
+
 # Annexes
 
 
@@ -182,7 +291,7 @@ FIXME simple geometry to avoid running into errors if metadata is currupted
 I initially thought that disabling autovacuum would be sufficient to avoid the
 FSM file creation, but it turns out that it is created as soon as the second
 data block is allocated (FIXME source ref).  And the FSM file can not be moved
-elsewhere, it stays this the data segment.  So to avoid running into issues
+elsewhere, it stays with the data segment.  So to avoid running into issues
 with a corrupted FSM that is not what I intended to test, I first needed to
 find where the FSM file would be created for a given FS type.
 
@@ -195,8 +304,9 @@ Here it is with XFS:
   byte_offset  begin_LBA    end_LBA    sectors
              0       6992       7039         48
 ```
+I had to exclude this section from the error generating sectors.
 
-And the ranges for the corresponding data file:
+The ranges for the corresponding data file:
 ```
 [root@pg ~]# hdparm --fibmap /mnt/error_mount/data/PG_11_201809051/13287/16387
 
@@ -206,14 +316,10 @@ And the ranges for the corresponding data file:
              0       6976       6991         16
           8192       7040       7407        368
 ```
-So what interests me is the starting point of the second range, the logical
+What interests me is the starting point of the second range, the logical
 block address "7040".  With a sector size of 512 bytes, that gives us a
 starting point for corrupted blocks at 3604480 bytes, or 880 blocks of size
 4096 bytes.
-
 This way, errors will start to raise immediately after the FSM has been
 created, and should only affect data segment after the first block.
-
-So I had to exclude this section from the error generating sectors.
-
 

@@ -106,10 +106,10 @@ ALTER SYSTEM SET logging_collector = on;
 ALTER SYSTEM SET log_destination = 'stderr, csvlog';
 ALTER SYSTEM SET log_filename = 'postgresql.log';
 ALTER SYSTEM SET log_checkpoints = on;
+--ALTER SYSTEM SET log_connections = on;
+--ALTER SYSTEM SET log_disconnections = on;
 ALTER SYSTEM SET log_error_verbosity = verbose;
 ALTER SYSTEM SET max_wal_size = '5GB';
-ALTER SYSTEM SET checkpoint_timeout = '60min';
-ALTER SYSTEM SET checkpoint_completion_target = '0.5';
 ALTER SYSTEM SET autovacuum = off;
 EOF
     # Restart the instance.
@@ -138,10 +138,6 @@ CREATE TABLE reftable(
     insert_time timestamptz DEFAULT clock_timestamp(),
     insert_lsn pg_lsn DEFAULT pg_current_wal_insert_lsn()
 );
--- Create table to generate dirty blocks and add memory pressure.
---CREATE TABLE filltable(
---    padding char(474) NOT NULL
---);
 -- Table used to store checkpoints details.
 CREATE TABLE checkpoint_log(
     checkpoint_lsn pg_lsn,
@@ -241,26 +237,42 @@ stubborn_query() {
             # Start PostgreSQL and wait for startup to finish.
             pg_ctl -D "$PGDATA" -w start -l "${PGDATA}/startup.log"
 
-            # FIXME re-create filltables after this, to avoid side effect of
-            # the resetwal (corrupted catalog pointing on non-existant tables).
-            # FIXME note that we may also have orphaned files
-            # FIXME this is way too long
-            # FIXME end with a forced checkpoint?
-            relcount=1
-            while [ "$relcount" -le "$relations_to_fill" ]; do
-                psql -Atc <<EOF
-DROP TABLE IF EXISTS filltable_${relcount}";
-CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL)";
+            if [ -n "$do_filldata" ]; then
+                # FIXME truncate filltable after this, to avoid side effect of the
+                # resetwal
+                psql -At <<EOF
+TRUNCATE filltable;
 EOF
-                (( ++relcount ))
-            done
-            # vacuum critical catalog tables to avoid excess bloating due to
-            # many relations dropped/created
-            psql -Atc "VACUUM pg_catalog.pg_class"
-            psql -Atc "VACUUM pg_catalog.pg_attribute"
-            psql -Atc "VACUUM pg_catalog.pg_type"
-            psql -Atc "VACUUM pg_catalog.pg_depend"
-            # FIXME is this usefull?
+            fi
+
+            if [ -n "$do_filltables" ]; then
+                # FIXME re-create filltables after this, to avoid side effect of
+                # the resetwal (corrupted catalog pointing on non-existant tables).
+                # FIXME note that we may also have orphaned files
+                # FIXME this is way too long
+                # FIXME end with a forced checkpoint?
+                # FIXME errors:
+#NOTICE:  table "filltable_2972" does not exist, skipping
+#DROP TABLE
+#ERROR:  type "filltable_2972" already exists
+                relcount=1
+                while [ "$relcount" -le "$relations_to_fill" ]; do
+                    psql -At <<EOF
+DROP TABLE IF EXISTS filltable_${relcount};
+CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL);
+EOF
+                    (( ++relcount ))
+                done
+                # vacuum critical catalog tables to avoid excess bloating due to
+                # many relations dropped/created
+                psql -Atc "VACUUM pg_catalog.pg_class"
+                psql -Atc "VACUUM pg_catalog.pg_attribute"
+                psql -Atc "VACUUM pg_catalog.pg_type"
+                psql -Atc "VACUUM pg_catalog.pg_depend"
+            fi
+
+            # FIXME is this usefull? it will reset the checkpoint timeout
+            # counter ... but maybe that is better
             psql -Atc 'CHECKPOINT'
 
             # Copy resetwal informations to keep track of what happened here
@@ -288,6 +300,7 @@ pre_insert_data() {
     # FIXME first test: logical block 14330
     # FIXME second test: size was 2344 kB, logical block 14334
     # FIXME set a variable for this, depending on FS used?
+    # FIXME raise work_mem for generate_series?
     stubborn_query -v "lines=${PREFILL_LINES_COUNT}" -At <<EOF
 WITH inserted AS (
     INSERT INTO errtable (padding)
@@ -307,10 +320,9 @@ insert_data() {
     # This is the insertion that should ultimately write to bad blocks, and
     # trigger writeback errors... but the insertion itself should succeed, it's
     # the next occuring checkpoint that needs to fail.
-    # FIXME zero_damaged_pages necessary?
     stubborn_query -v "lines=${ERROR_LINES_COUNT}" -At <<EOF
 -- Avoid query failing on read errors.
---SET zero_damaged_pages = ON;
+SET zero_damaged_pages = ON;
 WITH inserted AS (
     INSERT INTO errtable (padding)
     SELECT ('blanks follow:')
@@ -321,7 +333,22 @@ SELECT i.id, c.checkpoint_lsn FROM inserted i, pg_control_checkpoint() c;
 EOF
 }
 
-saturate_memory() {
+prepare_filltables() {
+
+    # FIXME create all "relations to fill"
+    # FIXME this is way too long
+    #       ~20 min for 80640 tables
+    relcount=1
+    while [ "$relcount" -le "$relations_to_fill" ]; do
+        psql -Atc "CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL)"\
+            && (( ++relcount ))
+    done
+    # FIXME is this necessary?
+    psql -Atc 'CHECKPOINT'
+
+}
+
+fill_tables() {
     # Run queries that use up the server's memory, so that the operating system
     # will have to writeback dirty blocks to storage.  The purpose is to have
     # background OS process sync the corrupted dirty blocks and raise IO errors
@@ -393,6 +420,176 @@ EOF
 
 }
 
+# FIXME same that "full_tables", using DELETE instead of TRUNCATE
+# FIXME very, very slow, and seems kinda useless
+fill_tables_delete() {
+    relcount=1
+    while [ "$relcount" -le "$relations_to_fill" ]; do
+        stubborn_query -At <<EOF
+DELETE FROM filltable_${relcount};
+VACUUM filltable_${relcount};
+INSERT INTO filltable_${relcount} (padding)
+    SELECT ('blanks follow:')
+    FROM generate_series(1,16);
+EOF
+    (( ++relcount ))
+    done
+
+}
+
+
+is_next_checkpoint_far() {
+
+	# FIXME query used to estimate if the next checkpoint is near starting its
+	# work
+	result=$(stubborn_query -At <<EOF
+WITH settings AS (
+    SELECT round (
+            (
+                string_agg(setting, '')
+                FILTER (WHERE name='checkpoint_timeout')
+            )::int * (
+                string_agg(setting, '')
+                FILTER (WHERE name='checkpoint_completion_target')
+            )::double precision
+        )::text::interval AS estimated_checkpoint_duration
+    FROM pg_settings
+)
+SELECT now() < ( checkpoint_time + estimated_checkpoint_duration )
+FROM pg_control_checkpoint(), settings;
+EOF
+	)
+	[ "$result" = "t" ]
+	return $?
+
+}
+
+write_many_files_before_chkp() {
+
+    i=0
+    # Cleanup temp files dir.
+    rm "${tmpfilesdir}/*" || true
+    # FIXME also check for FS full?
+    while is_next_checkpoint_far; do
+        dd if=/dev/zero of="${tmpfilesdir}/tmp_${i}" bs=8182 count=1
+        (( ++i ))
+    done
+
+    # FIXME Force a manual sync to try to capture every fsync errors before
+    # PostgreSQL can run a checkpoint?
+    sudo sync || true
+
+}
+
+# FIXME probably completely wrong
+is_checkpoint_running() {
+
+	# FIXME query used to estimate if the next checkpoint is near starting its
+	# work
+	result=$(stubborn_query -At <<EOF
+WITH settings AS (
+    SELECT
+        (
+            string_agg(setting, '')
+            FILTER (WHERE name='checkpoint_timeout')
+        )::int AS checkpoint_timeout,
+        round (
+            (
+                string_agg(setting, '')
+                FILTER (WHERE name='checkpoint_timeout')
+            )::int * (
+                string_agg(setting, '')
+                FILTER (WHERE name='checkpoint_completion_target')
+            )::double precision
+        )::text::interval AS estimated_checkpoint_duration
+    FROM pg_settings
+)
+SELECT
+    now() > ( checkpoint_time + ( checkpoint_timeout - estimated_checkpoint_duration ) )
+    AND now() < ( checkpoint_time + checkpoint_timeout )
+FROM pg_control_checkpoint(), settings;
+EOF
+	)
+	[ "$result" = "t" ]
+	return $?
+
+}
+
+# FIXME probably completely wrong
+write_many_files_during_chkp() {
+
+    i=0
+    # Cleanup temp files dir.
+    rm "${tmpfilesdir}/*" || true
+    # FIXME also check for FS full?
+    while is_checkpoint_running; do
+        dd if=/dev/zero of="${tmpfilesdir}/tmp_${i}" bs=8182 count=1
+        (( ++i ))
+        # FIXME Force a manual sync to try to capture every fsync errors before
+        # PostgreSQL can run a checkpoint?
+        #sudo sync || true
+    done
+
+}
+
+prepare_filldata() {
+
+    # Create table to generate dirty blocks and add memory pressure.
+    psql -At <<EOF
+CREATE TABLE filltable(
+    padding char(474) NOT NULL
+);
+EOF
+
+}
+
+fill_data() {
+
+    # Insert data on a single table without generating errors to apply pressure
+    # on memory and cause writeback.
+    stubborn_query -v "lines=${lines_to_fill}" -At <<EOF
+DELETE FROM filltable;
+VACUUM filltable;
+INSERT INTO filltable (padding)
+    SELECT ('blanks follow:')
+    FROM generate_series(1,:lines);
+EOF
+
+}
+
+# Create the C function used to burn fd during tests.
+prepare_burnfd() {
+
+    # FIXME for now, this requires sudo for postgres user to write into this
+    # folder...  deal with this so sudo is not necessary
+    shared_dir="/share"
+    include_dir="$(pg_config --includedir)/server"
+    pg_lib_dir="$(pg_config --pkglibdir)"
+    (
+        cd "$shared_dir" &&
+        sudo cc -I"$include_dir" -fPIC -c burn_fd.c &&
+        sudo cc -shared -o burn_fd.so burn_fd.o &&
+        cp burn_fd.so "$pg_lib_dir"
+    )
+    psql -At <<EOF
+CREATE FUNCTION burn_fd(integer) RETURNS void
+     AS 'burn_fd'
+     LANGUAGE C STRICT;
+EOF
+
+}
+
+burn_fd() {
+
+    # Execute a C function to burn FD as fast as possible.
+    stubborn_query -At <<EOF
+SELECT burn_fd(80640);
+EOF
+
+}
+
+
+
 wait_checkpoint() {
     # Get latest checkpoint LSN from data inserted into reference table.
     last_chkp_lsn=$(echo "SELECT checkpoint_lsn FROM reftable ORDER BY refid DESC LIMIT 1;" | stubborn_query -At)
@@ -411,7 +608,65 @@ EOF
 }
 
 
+enable_traces() {
+
+    # Remove all previous audit traces and all previous audit trace files.
+    sudo auditctl -D
+    sudo sh -c "rm -f /var/log/audit/* || true"
+    sudo systemctl restart auditd.service
+
+    # Get relfilenode path for the error table.
+    filepath=$(psql -At <<EOF
+SELECT regexp_replace(
+    pg_relation_filepath('errtable'),
+    '^pg_tblspc/[[:digit:]]+/',
+    '${tbs_dir}'
+);
+EOF
+)
+
+    # Create a new audit trace for all syscalls on the file.
+    sudo auditctl -w "$filepath" -k trace_errtable_file
+
+    # Create a new audit trace for all sync syscalls on the filesystem.
+    sudo auditctl -a always,exit -F arch=b64 -S sync -S fsync -S msync \
+        -S fdatasync -S sync_file_range -S syncfs -F dir="$tbs_dir" \
+        -k trace_sync
+
+    # Enable kernel traces on IO related events.
+    # FIXME warning:
+    #[Sun Jul 28 18:16:26 2019] Scheduler tracepoints stat_sleep, stat_iowait,
+    #stat_blocked and stat _runtime require the kernel parameter
+    #schedstats=enable or kernel.sched_schedstats=1
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/block/enable'
+    # FIXME should choose depending on FS type
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/xfs/enable'
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/jbd2/enable'
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/mmc/enable'
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/sched/enable'
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/workqueue/enable'
+    sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on'
+
+}
+
+disable_traces() {
+
+    # Disable kernel traces on IO related events.
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/block/enable'
+    # FIXME should choose depending on FS type
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/xfs/enable'
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/jbd2/enable'
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/mmc/enable'
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/sched/enable'
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/workqueue/enable'
+    sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on'
+
+}
+
+
 launch_scenario() {
+
+    enable_traces
 
     # Log the last successfull checkpoint, before testing starts.
     stubborn_query -At <<EOF
@@ -421,13 +676,18 @@ COPY (
 ) TO PROGRAM 'cat - >> ${collect_dir}/checkpoint_log.dump';
 EOF
     # Actually launch the test using scenario configuration.
-    i=1
-    while [ "$i" -lt "$TEST_COUNT" ]; do
+    test=1
+    while [ "$test" -le "$TEST_COUNT" ]; do
         # Execute simple insert SQL query, increment count only if query
         # succeeded.
-        insert_data && (( ++i ))
+        insert_data && (( ++test ))
         # FIXME conditional and bool GUC here?
-        saturate_memory
+        [ -n "$do_filldata" ] && fill_data
+        [ -n "$do_filltables" ] && fill_tables
+        [ -n "$do_filltablesdelete" ] && fill_tables_delete
+        [ -n "$do_burnfd" ] && burn_fd
+        [ -n "$do_writemanyfilesbeforechkp" ] && write_many_files_before_chkp
+        [ -n "$do_writemanyfilesduringchkp" ] && write_many_files_during_chkp
         # FIXME capture memory and fs infos and insert these into PostgreSQL
         # log tables to keep tracks of the evolution during the tests?
         grep -e "Dirty:" -e "Writeback:" /proc/meminfo
@@ -435,6 +695,9 @@ EOF
         # Wait until next checkpoint (or PG crash).
         wait_checkpoint
     done
+
+    disable_traces
+
 }
 
 # Load events related to the test to various tables so analysis can be done.
@@ -446,6 +709,7 @@ COPY checkpoint_log(checkpoint_lsn, redo_lsn, checkpoint_time)
 FROM '${collect_dir}/checkpoint_log.dump';
 EOF
     # Import resetwal history.
+    # FIXME this file may not exist if no resetwal occured
     psql <<EOF
 COPY resetwal_log(resetwal_lsn, resetwal_time)
 FROM '${collect_dir}/resetwal_log.dump';
@@ -598,6 +862,7 @@ EOF
 # - specifically modified parameters
 # - full recap report
 compute_reports() {
+
     # Compute short and detailed text reports.
     mkdir -p "${report_dir}/full_report"
     echo "Scenario played: ${scenario}" >> "${report_dir}/short_report.txt"
@@ -628,6 +893,20 @@ EOF
     # Missing lines.
     missing_lines=$(psql -Atc "SELECT sum(missing_lines) FROM missed_errors")
     echo "Missing lines due to corruptions: $missing_lines" >> "${report_dir}/short_report.txt"
+
+    # Get audit informations.
+    #sudo ausearch -k trace_errtable_file > "${report_dir}/full_report/audit_file.log"
+    # shellcheck disable=SC2024
+    sudo sh -c 'cat /var/log/audit/*' > "${report_dir}/full_report/audit_file.log"
+
+    # Get kernel debug traces.
+    # shellcheck disable=SC2024
+    sudo sh -c 'cat /sys/kernel/debug/tracing/trace' > "${report_dir}/full_report/kernel_trace.log"
+    # shellcheck disable=SC2024
+    sudo sh -c 'cat /sys/kernel/debug/tracing/trace_pipe' > "${report_dir}/full_report/kernel_trace_pipe.log"
+
+    # Remove all audit traces.
+    sudo auditctl -D
 
 }
 
@@ -725,6 +1004,21 @@ fi
 #    etc. die ...
 #fi
 
+# Initialize booleans and GUC parameters.
+# Parameter to set to apply memory pressure using data insertion on a single
+# table.
+do_filldata=""
+# Parameter to set to apply memory pressure using data insertion on multiple
+# tables, and to burn fd using truncates.
+do_filltables=""
+# Same, but using DELETE instead of TRUNCATE.
+do_filltablesdelete=""
+# Parameter to set to use a C function to burn many fd.
+do_burnfd=""
+# Parameter to set to use "dd" to create many files.
+do_writemanyfilesduringchkp=""
+do_writemanyfilesbeforechkp=""
+
 # Setup logfile names if not defined.
 PGLOG=${PGLOG:-${PGDATA}/log/postgresql.log}
 PGCSVLOG=${PGCSVLOG:-${PGDATA}/log/postgresql.csv}
@@ -775,47 +1069,42 @@ PREFILL_LINES_COUNT=64
 case "$scenario" in
   "1")
     # Scenario 1
-    # - checkpoint heavy run test
-    # To be used with pgdata on bad local FS (test EIO)
-    # FIXME also, with NFS mounted and hypervisor bad FS?
-    # Ensure normal FS cache cleanup.
-    set_default_sysctl
-    ;;
-  "2")
-    # Scenario 2
-    # - checkpoint light run test
-    # To be used with pgdata on bad fs (test eio) and with aggressive Linux kernel
-    # settings (https://www.kernel.org/doc/Documentation/sysctl/vm.txt):
-    # - "vm.background_dirty_bytes"
-    # - "vm.dirty_bytes"
-    # - "vm.dirty_writeback_centisecs"
-    # - "vm.dirty_expire_centisecs"
-    # Or (maybe simpler than twisting settings):
-    # - launch aggressively "sync" command in background
-    # Configure instance.
-    # FIXME very low shared buffers?
-    # FIXME disable *_flush_after (PG9.5-and-lower like)?
+    # FIXME very high (relatively) shared buffers to saturate memory during
+    # checkpoints
+    # delete and insert data into a very high tables number to saturate
+    # memory and fd
     psql <<EOF
+ALTER SYSTEM SET shared_buffers = '700MB';
+--ALTER SYSTEM SET shared_buffers = '256MB';
 ALTER SYSTEM SET checkpoint_flush_after = 0;
 ALTER SYSTEM SET bgwriter_flush_after = 0;
 ALTER SYSTEM SET backend_flush_after = 0;
-SELECT pg_reload_conf();
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.5';
 EOF
+    # Restart.
+    pg_ctl -D "$PGDATA" -m fast -w stop
+    pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
     # Aggressive FS cache cleanup by OS.
     # FIXME running user must be in sudoers without password asked for this to
     # work
     set_aggressive_sysctl
     # FIXME
-    #pre_insert_data
+    do_filltablesdelete="true"
     ;;
-  "3")
-    # Scenario 3
-    # FIXME very high (relatively) shared buffers to sature memory during checkpoints
+  "2")
+    # Scenario 2
+    # FIXME very high (relatively) shared buffers to saturate memory during
+    # checkpoints
+    # insert high volume of data data to saturate memory, and burn fd using a
+    # custom function
     psql <<EOF
 ALTER SYSTEM SET shared_buffers = '700MB';
 ALTER SYSTEM SET checkpoint_flush_after = 0;
 ALTER SYSTEM SET bgwriter_flush_after = 0;
 ALTER SYSTEM SET backend_flush_after = 0;
+ALTER SYSTEM SET checkpoint_timeout = '20min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.5';
 EOF
     # Restart.
     pg_ctl -D "$PGDATA" -m fast -w stop
@@ -824,71 +1113,182 @@ EOF
     # FIXME running user must be in sudoers without password asked for this to
     # work
     set_aggressive_sysctl
-
     # FIXME
-    #pre_insert_data
+    do_filldata="true"
+    #do_burnfd="true"
+    #do_writemanyfilesbeforechkp="true"
     ;;
-  "4")
-    # Scenario 4
-    # - very low shared_buffers
-    # Aggressive FS cache cleanup by OS.
-    # FIXME running user must be in sudoers without password asked for this to
-    # work
-    set_aggressive_sysctl
-    # Configure instance.
-    # FIXME very low shared buffers?
+  "3")
+    # Scenario 3
+    # FIXME THIS SCENARIO DOES REPRODUCE THE PROBLEM
+    # FIXME very high (relatively) shared buffers to saturate memory during
+    # checkpoints
+    # truncate and insert data into a very high tables number to saturate
+    # memory and fd
     psql <<EOF
-ALTER SYSTEM SET shared_buffers = '128kB';
+ALTER SYSTEM SET shared_buffers = '700MB';
+--ALTER SYSTEM SET shared_buffers = '256MB';
 ALTER SYSTEM SET checkpoint_flush_after = 0;
 ALTER SYSTEM SET bgwriter_flush_after = 0;
 ALTER SYSTEM SET backend_flush_after = 0;
+ALTER SYSTEM SET checkpoint_timeout = '60min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.5';
 EOF
     # Restart.
     pg_ctl -D "$PGDATA" -m fast -w stop
     pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
+    # Aggressive FS cache cleanup by OS.
+    # FIXME running user must be in sudoers without password asked for this to
+    # work
+    set_aggressive_sysctl
+    # FIXME
+    do_filltables="true"
+    ;;
+  "4")
+    # Scenario 4
+    # Only burn fd
+    psql <<EOF
+ALTER SYSTEM SET checkpoint_flush_after = 0;
+ALTER SYSTEM SET bgwriter_flush_after = 0;
+ALTER SYSTEM SET backend_flush_after = 0;
+ALTER SYSTEM SET checkpoint_timeout = '5min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.9';
+EOF
+    # Restart.
+    pg_ctl -D "$PGDATA" -m fast -w stop
+    pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
+    # Aggressive FS cache cleanup by OS.
+    # FIXME running user must be in sudoers without password asked for this to
+    # work
+    set_aggressive_sysctl
+    # Burn fd using custom function.
+    do_burnfd="true"
+    ;;
+  "5")
+    # Scenario 5
+    # Use "dd" to write as many files as possible.
+    psql <<EOF
+ALTER SYSTEM SET checkpoint_flush_after = 0;
+ALTER SYSTEM SET bgwriter_flush_after = 0;
+ALTER SYSTEM SET backend_flush_after = 0;
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.5';
+EOF
+    # Restart.
+    pg_ctl -D "$PGDATA" -m fast -w stop
+    pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
+    # Aggressive FS cache cleanup by OS.
+    # FIXME running user must be in sudoers without password asked for this to
+    # work
+    set_aggressive_sysctl
+    # Burn fd using custom function.
+    do_writemanyfilesbeforechkp="true"
+    ;;
+  "6")
+    # Scenario 6
+    # FIXME very high (relatively) shared buffers to saturate memory during
+    # checkpoints
+    # truncate and insert data into a very high tables number to saturate
+    # memory and fd
+    # FIXME adapt/disable bgwriter:
+    #bgwriter_delay, bgwriter_lru_maxpages, bgwriter_lru_multiplier
+    psql <<EOF
+ALTER SYSTEM SET shared_buffers = '500MB';
+--ALTER SYSTEM SET shared_buffers = '128MB';
+--ALTER SYSTEM SET shared_buffers = '256MB';
+ALTER SYSTEM SET checkpoint_flush_after = 0;
+ALTER SYSTEM SET bgwriter_flush_after = 0;
+ALTER SYSTEM SET backend_flush_after = 0;
+--ALTER SYSTEM SET checkpoint_timeout = '15min';
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+ALTER SYSTEM SET checkpoint_completion_target = '0.5';
+EOF
+    # Restart.
+    pg_ctl -D "$PGDATA" -m fast -w stop
+    pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
+    # Aggressive FS cache cleanup by OS.
+    # FIXME running user must be in sudoers without password asked for this to
+    # work
+    set_aggressive_sysctl
+    # FIXME
+    do_filltables="true"
     ;;
   "*") echo "Unknown scenario." ; exit 1 ;;
+# FIXME other possible scenarios
+#  "FIXME")
+#    # Scenario FIXME
+#    # - checkpoint heavy run test
+#    # To be used with pgdata on bad local FS (test EIO)
+#    # FIXME also, with NFS mounted and hypervisor bad FS?
+#    # Ensure normal FS cache cleanup.
+#    set_default_sysctl
+#    ;;
+#  "FIXME")
+#    # Scenario FIXME
+#    # - very low shared_buffers
+#    # Aggressive FS cache cleanup by OS.
+#    # FIXME running user must be in sudoers without password asked for this to
+#    # work
+#    set_aggressive_sysctl
+#    # Configure instance.
+#    # FIXME very low shared buffers?
+#    psql <<EOF
+#ALTER SYSTEM SET shared_buffers = '128kB';
+#ALTER SYSTEM SET checkpoint_flush_after = 0;
+#ALTER SYSTEM SET bgwriter_flush_after = 0;
+#ALTER SYSTEM SET backend_flush_after = 0;
+#EOF
+#    # Restart.
+#    pg_ctl -D "$PGDATA" -m fast -w stop
+#    pg_ctl -D "$PGDATA" start -l "${PGDATA}/startup.log"
+#    ;;
 esac
 
+# FIXME prepare objects to be used in the scenario
+if [ -n "$do_filldata" ]; then
+    # Get number of lines required to fill the shared buffers with dirty
+    # blocks, so we can apply pressure on FS cache during checkpoint.
+    # Based on the filltable attribute definition, 16 tuples inserted fill one
+    # 8kB block.  So to completely fill shared buffers, we would need to insert
+    # ( shared_buffers * 16 ) lines.
+    # To be safe and avoid backends having to fsync dirty blocks (and possibly
+    # trigger errors we want the checkpointer to get), we work on 90% af shared
+    # buffers.
+    # FIXME only for saturate_memory scenarios?  bool GUC?
+    lines_to_fill=$(psql -At << EOF
+SELECT ( setting::int * 0.9 * 16 )::int
+FROM pg_settings
+WHERE name = 'shared_buffers';
+EOF
+    )
+    prepare_filldata
+fi
 
-# Get number of lines required to fill the shared buffers with dirty
-# blocks, so we can apply pressure on FS cache during checkpoint.
-# Based on the filltable attribute definition, 16 tuples inserted fill one
-# 8kB block.  So to completely fill shared buffers, we would need to insert
-# ( shared_buffers * 16 ) lines.
-# To be safe and avoid backends having to fsync dirty blocks (and possibly
-# trigger errors we want the checkpointer to get), we work on 90% af shared
-# buffers.
-# FIXME only for saturate_memory scenarios?  bool GUC?
-# FIXME instead, generate "relations_to_fill" tables, and truncate every one to
-# mess with the system fd cache... but this is very, very long.  Should we
-# "burn" fd differently, outside from postgres?
-relations_to_fill=$(psql -At << EOF
+if [ -n "${do_filltables}${do_filltablesdelete}" ]; then
+    # Get number of relations that will be used to fill 90% of the shared
+    # buffers with dirty blocks, assuming that every relation will be inserted
+    # only on 8kB block of data (16 lines).
+    relations_to_fill=$(psql -At << EOF
 SELECT ( setting::int * 0.9 )::int
 FROM pg_settings
 WHERE name = 'shared_buffers';
 EOF
-)
+    )
+    prepare_filltables
+fi
 
-# FIXME create all "relations to fill"
-# FIXME this is way too long
-# FIXME end with a forced checkpoint?
-#       ~20 min for 80640 tables
-relcount=1
-while [ "$relcount" -le "$relations_to_fill" ]; do
-    psql -Atc "CREATE TABLE filltable_${relcount}(padding char(474) NOT NULL)"\
-        && (( ++relcount ))
-done
-psql -Atc 'CHECKPOINT'
+if [ -n "$do_burnfd" ]; then
+    prepare_burnfd
+fi
+
+if [ -n "${do_writemanyfilesduringchkp}${do_writemanyfilesbeforechkp}" ]; then
+    tmpfilesdir="tmpfilesdir"
+    mkdir -p $tmpfilesdir
+    rm "$tmpfilesdir/*" || true
+fi
 
 # Lauch test
 launch_scenario
-
-# FIXME Force a manual sync to try to capture every fsync errors before
-# PostgreSQL can run a checkpoint?
-#sudo sync || true
-
-
 
 # We should get at least one last timed checkpoint here.
 # FIXME not true anymore, depends on "checkpoint_timeout" parameter value
