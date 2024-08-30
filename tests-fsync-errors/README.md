@@ -36,7 +36,6 @@ Scripts inspired by Craig Ringer test case:
 Patch "PANIC on fsync" introduced in 11.2:
 
 - https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=9ccdd7f66e3324d2b6d3dec282cfa9ff084083f1
-- 
 
 Thomas Munro conference on difficulties for PostgreSQL hackers interacting with OS: https://papers.freebsd.org/2019/FOSDEM/munro-walking_through_walls.files/fosdem_walking_through_walls.pdf
 
@@ -67,7 +66,7 @@ using `max_files_per_process` setting (it is taken in account while defining
 the internal variable `max_safe_fds` used by the actual code, but PostgreSQL
 also tries to compute actual system limits including already opened file
 descriptors).
-FIXME is this section stolen from somewhere?
+FIXME reference?
 
 See the following comments for detailed descriptions:
 - https://doxygen.postgresql.org/fd_8c_source.html#l00262
@@ -111,7 +110,7 @@ FIXME TODO
 FIXME TODO
 
 
-# Reproducting the problem
+# Reproducing the problem
 
 Reproducing the problem before 11.2 where PostgreSQL retries a failed `fsync`
 and it succeeds, leading to data corruption, is simple enough.  Craig Ringer
@@ -130,7 +129,7 @@ My test scenario does the following:
   related to this write so we can later compare if this data was lost (using a
   foreign key), and what checkpoint should have detected the error (based on
   write time, LSN, etc.)
-- disconnect the backend, so that the FD are closed (should rise the
+- disconnect the backend, so that the FD are closed (should increase the
   probability that the error is not reported, at least on unpatched kernels
   4.13, 4.15 and 4.16, and possibly before 4.13)
 - write some data on another, sane, table, to dirty more buffers and accelerate
